@@ -97,8 +97,9 @@ end
 local CFG = {
 	Webhook      = "",
 	ScanOnStart  = true,
-	SpyOnStart   = true,
-	MaxLog       = 4000,     -- max de eventos guardados
+	SpyOnStart   = false,    -- spy NAO liga sozinho: hook em __namecall pode causar kick
+	MaxLog       = 2000,     -- max de eventos guardados
+	SpyUIUpdate  = 0.5,      -- s entre updates da UI do spy (throttle)
 	MaxArgLen    = 400,      -- corta argumento gigante
 	LogBindables = false,    -- bindables sao locais; off por padrao
 	IgnoreList   = {         -- padroes ignorados no spy (anti-spam)
@@ -277,29 +278,36 @@ end
 ----------------------------------------------------------------------
 -- SCAN
 ----------------------------------------------------------------------
+local scanning = false
 local function scanRemotes()
+	if scanning then return RemoteCount end
+	scanning = true
 	Remotes = {}
 	RemoteCount = 0
 
-	local roots = { game }
-	for _, root in ipairs(roots) do
-		local desc = try(function() return root:GetDescendants() end) or {}
-		for _, inst in ipairs(desc) do
-			if isRemote(inst) then
-				local p = fullPath(inst)
-				if not Remotes[p] then
-					Remotes[p] = {
-						Class = inst.ClassName,
-						Path = p,
-						Name = inst.Name,
-					}
-					RemoteCount = RemoteCount + 1
-				end
+	-- em lotes: varrer o jogo inteiro de uma vez trava o cliente (kick)
+	local desc = try(function() return game:GetDescendants() end) or {}
+	local total = #desc
+	for i, inst in ipairs(desc) do
+		if isRemote(inst) then
+			local p = fullPath(inst)
+			if not Remotes[p] then
+				Remotes[p] = {
+					Class = inst.ClassName,
+					Path = p,
+					Name = inst.Name,
+				}
+				RemoteCount = RemoteCount + 1
 			end
+		end
+		if i % 3000 == 0 then
+			StatusFn(("Escaneando... %d/%d (%d remotes)"):format(i, total, RemoteCount), YELLOW)
+			task.wait()
 		end
 	end
 
 	ScanDone = true
+	scanning = false
 	StatusFn(("Scan: %d remotes encontrados"):format(RemoteCount), GREEN)
 	return RemoteCount
 end
@@ -327,14 +335,37 @@ end
 ----------------------------------------------------------------------
 -- SPY
 ----------------------------------------------------------------------
+-- throttle da UI: serializar argumentos e atualizar Paragraph a cada
+-- chamada de remote trava o cliente. Loga direto, UI atualiza em lote.
+local uiDirty = false
+local lastUI = 0
+
 local function pushLog(line)
 	SpyCount = SpyCount + 1
 	SpyLog[#SpyLog + 1] = line
 	if #SpyLog > CFG.MaxLog then
 		table.remove(SpyLog, 1)
 	end
-	LogFn(line)
+	uiDirty = true
+	local now = os.clock()
+	if now - lastUI >= CFG.SpyUIUpdate then
+		lastUI = now
+		uiDirty = false
+		try(LogFn, line)
+	end
 end
+
+-- loop que garante flush do restante do log pra UI
+task.spawn(function()
+	while true do
+		task.wait(CFG.SpyUIUpdate)
+		if uiDirty and SpyOn then
+			uiDirty = false
+			lastUI = os.clock()
+			try(LogFn, SpyLog[#SpyLog] or "")
+		end
+	end
+end)
 
 local function logRemoteCall(kind, inst, args, origin)
 	if not SpyOn then return end
@@ -345,7 +376,7 @@ local function logRemoteCall(kind, inst, args, origin)
 	if ignored(inst.Name) then return end
 
 	local path = fullPath(inst)
-	local argStr = fmtArgs(args)
+	local argStr = try(fmtArgs, args) or "--[[erro ao serializar]]"
 	local line = ("-- [%s] %s\n%s:%s(%s)"):format(
 		kind,
 		origin or "?",
@@ -362,59 +393,81 @@ end
 -- hook __namecall
 local hooked = false
 local oldNamecall
-local function hookSpy()
-	if hooked then return end
-	hooked = true
 
+-- dentro do hook: rapido e sem falhar. SEM task.spawn — uma thread por
+-- chamada de remote derruba o cliente.
+local function hookSpy()
+	if hooked then return true end
+
+	-- caminho 1 (preferido): hookmetamethod — mais seguro e estavel
+	if hookmetamethod then
+		oldNamecall = try(function()
+			return hookmetamethod(game, "__namecall", newcclosure and newcclosure(function(self, ...)
+				if SpyOn and not checkcaller() and isRemote(self) then
+					local method = try(getnamecallmethod) or ""
+					if method == "FireServer" or method == "InvokeServer"
+						or method == "Fire" or method == "Invoke" then
+						try(logRemoteCall, "namecall", self, { ... }, method)
+					end
+				end
+				return oldNamecall(self, ...)
+			end) or function(self, ...)
+				if SpyOn and not checkcaller() and isRemote(self) then
+					local method = try(getnamecallmethod) or ""
+					if method == "FireServer" or method == "InvokeServer"
+						or method == "Fire" or method == "Invoke" then
+						try(logRemoteCall, "namecall", self, { ... }, method)
+					end
+				end
+				return oldNamecall(self, ...)
+			end)
+		end)
+		if oldNamecall then
+			hooked = true
+			return true
+		end
+	end
+
+	-- caminho 2 (fallback): getrawmetatable + setreadonly
 	local mt = try(function() return getrawmetatable(game) end)
 	if not mt then
-		StatusFn("Spy: getrawmetatable indisponivel", RED)
+		StatusFn("Spy: executor sem hookmetamethod/getrawmetatable", RED)
 		return false
 	end
 
 	try(function() setreadonly(mt, false) end)
 	oldNamecall = mt.__namecall
+	if not oldNamecall then
+		StatusFn("Spy: __namecall nao encontrado", RED)
+		return false
+	end
 
-	mt.__namecall = newcclosure and newcclosure(function(self, ...)
-		local method = try(function() return getnamecallmethod() end) or ""
-		local args = { ... }
-
+	local function handler(self, ...)
 		if SpyOn and isRemote(self) then
+			local method = try(getnamecallmethod) or ""
 			if method == "FireServer" or method == "InvokeServer"
 				or method == "Fire" or method == "Invoke" then
-				task.spawn(logRemoteCall, "namecall", self, args, method)
-			end
-		end
-
-		return oldNamecall(self, ...)
-	end) or function(self, ...)
-		local method = try(function() return getnamecallmethod() end) or ""
-		local args = { ... }
-		if SpyOn and isRemote(self) then
-			if method == "FireServer" or method == "InvokeServer"
-				or method == "Fire" or method == "Invoke" then
-				task.spawn(logRemoteCall, "namecall", self, args, method)
+				try(logRemoteCall, "namecall", self, { ... }, method)
 			end
 		end
 		return oldNamecall(self, ...)
 	end
 
+	mt.__namecall = newcclosure and newcclosure(handler) or handler
 	try(function() setreadonly(mt, true) end)
+	hooked = true
 	return true
-end
-
--- hook firesignal (pega o que vem do servidor)
-local function hookFireSignal()
-	if not (getconnections and firesignal) then return end
-	-- nada global aqui; firesignal e usado sob demanda no dump
 end
 
 local function setSpy(on)
 	SpyOn = on
 	if on then
 		local ok = hookSpy()
-		if ok ~= false then
+		if ok then
 			StatusFn("Spy LIGADO — registrando chamadas", GREEN)
+		else
+			SpyOn = false
+			StatusFn("Spy FALHOU — executor sem suporte a hook", RED)
 		end
 	else
 		StatusFn("Spy DESLIGADO", YELLOW)
@@ -717,7 +770,7 @@ end
 
 TabSpy:Toggle({
 	Title = "Spy ligado",
-	Desc = "Hook em __namecall: registra FireServer / InvokeServer / Fire / Invoke",
+	Desc = "Registra FireServer / InvokeServer. ATENCAO: hook pode causar kick em jogos com anti-cheat — ligue so quando for usar",
 	Value = CFG.SpyOnStart,
 	Callback = function(v) setSpy(v) end,
 })
@@ -904,7 +957,9 @@ TabAbout:Button({
 _G.KOALA_DUMP_DESTROY = function()
 	SpyOn = false
 	if addedConn then pcall(function() addedConn:Disconnect() end) end
-	if oldNamecall then
+	-- desfaz o hook so se foi feito via getrawmetatable (hookmetamethod
+	-- nao precisa: o handler checa SpyOn, que ja esta false)
+	if oldNamecall and getrawmetatable and not hookmetamethod then
 		pcall(function()
 			local mt = getrawmetatable(game)
 			setreadonly(mt, false)
@@ -939,7 +994,7 @@ end
 try(function()
 	WindUI:Notify({
 		Title = "KOALA DUMP",
-		Content = "Carregado. Scan + Spy iniciando...",
+		Content = "Carregado. Scan rodando. Ligue o Spy na aba Spy quando quiser.",
 		Icon = "radar",
 		Duration = 4,
 	})
